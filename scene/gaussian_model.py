@@ -16,14 +16,18 @@ from torch_scatter import scatter_max
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
+from torch.utils.cpp_extension import load
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.ref_utils import generate_ide_fn
 from scene.embedding import Embedding
 
-    
+TINT_ROUGH_SEP = True
+HYBRID_IMP_2 = False
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -43,6 +47,40 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
+    def setup_dimension(self):
+        # Branching factors: distance, using view, using volumes
+        # Appearance dim handled outside of this function.
+
+        # Attributes: opacity, covariance, color
+
+        # Distance
+        opacity_dist_dim = 1 if self.add_opacity_dist else 0
+        cov_dist_dim = 1 if self.add_cov_dist else 0
+        color_dist_dim = 1 if self.add_color_dist else 0
+
+        # View
+        opacity_view_dim = 3
+        cov_view_dim = 3
+        color_view_dim = 3
+
+        # Original Implementation
+        self.opacity_dim = self.feat_dim + opacity_dist_dim + opacity_view_dim
+        self.cov_dim = self.feat_dim + cov_dist_dim + cov_view_dim
+        self.color_dim = self.feat_dim + color_dist_dim + color_view_dim
+
+        if self.enable_idiv:
+            self.idiv_dim = self.color_dim + 1
+        if self.ref:
+            self.tint_dim = self.color_dim + 1
+            self.rough_dim = self.color_dim + 1
+            ide_dim = 0
+            if self.deg_view == 4:
+                ide_dim = 1 + 38
+            elif self.deg_view == 5:
+                ide_dim = 1 + 72
+            else:
+                raise NotImplementedError('Only support IDE degree 4 or 5')
+            self.spec_dim = self.color_dim + ide_dim + 1
 
     def __init__(self, 
                  feat_dim: int=32, 
@@ -57,6 +95,11 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 idiv : bool = False,
+                 ref : bool = False,
+                 enable_idiv_iter : int = 5000,
+                 enable_ref_iter : int = 200,
+                 deg_view : int = 5,
                  ):
 
         self.feat_dim = feat_dim
@@ -73,6 +116,15 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+
+        # New Mode
+        self.idiv = idiv
+        self.enable_idiv = idiv
+        self.enable_idiv_iter = enable_idiv_iter
+        self.ref = ref
+        self.enable_ref = ref
+        self.enable_ref_iter = enable_ref_iter
+        self.deg_view = deg_view
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -94,6 +146,7 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self.setup_dimension()
 
         if self.use_feat_bank:
             self.mlp_feature_bank = nn.Sequential(
@@ -103,30 +156,69 @@ class GaussianModel:
                 nn.Softmax(dim=1)
             ).cuda()
 
-        self.opacity_dist_dim = 1 if self.add_opacity_dist else 0
         self.mlp_opacity = nn.Sequential(
-            nn.Linear(feat_dim+3+self.opacity_dist_dim, feat_dim),
+            nn.Linear(self.opacity_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, n_offsets),
             nn.Tanh()
         ).cuda()
 
-        self.add_cov_dist = add_cov_dist
-        self.cov_dist_dim = 1 if self.add_cov_dist else 0
         self.mlp_cov = nn.Sequential(
-            nn.Linear(feat_dim+3+self.cov_dist_dim, feat_dim),
+            nn.Linear(self.cov_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 7*self.n_offsets),
         ).cuda()
 
-        self.color_dist_dim = 1 if self.add_color_dist else 0
         self.mlp_color = nn.Sequential(
-            nn.Linear(feat_dim+3+self.color_dist_dim+self.appearance_dim, feat_dim),
+            nn.Linear(self.color_dim+self.appearance_dim, feat_dim),
             nn.ReLU(True),
             nn.Linear(feat_dim, 3*self.n_offsets),
             nn.Sigmoid()
         ).cuda()
 
+        if self.enable_idiv:
+            # idiv: directional vector, unnormalized
+            # Here we assume natural lighting and reduce the rank of the IDIV.
+            self.mlp_idiv = nn.Sequential(
+                nn.Linear(self.idiv_dim+self.appearance_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets)
+            ).cuda()
+
+            torch.nn.init.constant_(self.mlp_idiv[-1].bias, 1.0)
+
+        if self.ref:
+            self.ide_fn = generate_ide_fn(self.deg_view)
+
+            if TINT_ROUGH_SEP:
+                self.mlp_tint = nn.Sequential(
+                    nn.Linear(self.tint_dim+self.appearance_dim, feat_dim),
+                    nn.ReLU(True),
+                    nn.Linear(feat_dim, 3*self.n_offsets),
+                    nn.Softplus()
+                ).cuda()
+                self.mlp_roughness = nn.Sequential(
+                    nn.Linear(self.rough_dim+self.appearance_dim, feat_dim),
+                    nn.ReLU(True),
+                    nn.Linear(feat_dim, 1*self.n_offsets),
+                    nn.Softplus()
+                ).cuda()
+
+            else: # [tint, roughness]
+                self.mlp_tint = nn.Sequential(
+                    nn.Linear(self.tint_dim+self.appearance_dim, feat_dim),
+                    nn.ReLU(True),
+                    nn.Linear(feat_dim, 4*self.n_offsets),
+                    nn.Softplus()
+                ).cuda()
+
+            # Inputs: feature (feat_dim + 3), n*view (1), IDE (38 or 72), others
+            self.mlp_specular = nn.Sequential(
+                nn.Linear(self.spec_dim+self.appearance_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3),
+                nn.Softplus()
+            ).cuda()
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -136,6 +228,15 @@ class GaussianModel:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
             self.mlp_feature_bank.eval()
+        if self.idiv:
+            self.enable_idiv = True
+            self.mlp_idiv.eval()
+        if self.ref:
+            self.enable_ref = True
+            self.mlp_tint.eval()
+            if TINT_ROUGH_SEP:
+                self.mlp_roughness.eval()
+            self.mlp_specular.eval()
 
     def train(self):
         self.mlp_opacity.train()
@@ -143,8 +244,15 @@ class GaussianModel:
         self.mlp_color.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
-        if self.use_feat_bank:                   
+        if self.use_feat_bank:
             self.mlp_feature_bank.train()
+        if self.enable_idiv:
+            self.mlp_idiv.train()
+        if self.ref:
+            self.mlp_tint.train()
+            if TINT_ROUGH_SEP:
+                self.mlp_roughness.train()
+            self.mlp_specular.train()
 
     def capture(self):
         return (
@@ -203,7 +311,30 @@ class GaussianModel:
     @property
     def get_color_mlp(self):
         return self.mlp_color
-    
+
+    @property
+    def get_idiv_mlp(self):
+        return self.mlp_idiv
+
+    # @property
+    # def get_mid_feature_mlp(self):
+    #     if HYBRID_IMP_2 and self.enable_idiv and self.ref:
+    #         return self.mlp_mid_feature
+    #     return None
+
+    @property
+    def get_tint_mlp(self):
+        return self.mlp_tint
+
+    if TINT_ROUGH_SEP:
+        @property
+        def get_roughness_mlp(self):
+            return self.mlp_roughness
+
+    @property
+    def get_specular_mlp(self):
+        return self.mlp_specular
+
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
@@ -271,7 +402,6 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
-
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
 
@@ -281,8 +411,6 @@ class GaussianModel:
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
-        
-        
         if self.use_feat_bank:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -296,8 +424,11 @@ class GaussianModel:
                 {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
+            if self.appearance_dim > 0:
+                l.extend([
+                    {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
+                ])
         elif self.appearance_dim > 0:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -325,6 +456,28 @@ class GaussianModel:
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
+
+        if self.enable_idiv:
+            l.extend([
+                {'params': self.mlp_idiv.parameters(), 'lr': training_args.mlp_idiv_lr_init, "name": "mlp_idiv"}
+            ])
+
+        if self.ref and TINT_ROUGH_SEP:
+            l.extend([
+                {'params': self.mlp_tint.parameters(), 'lr': training_args.mlp_tint_lr_init, "name": "mlp_tint"},
+                {'params': self.mlp_roughness.parameters(), 'lr': training_args.mlp_roughness_lr_init, "name": "mlp_roughness"},
+                {'params': self.mlp_specular.parameters(), 'lr': training_args.mlp_specular_lr_init, "name": "mlp_specular"}
+            ])
+        elif self.ref:
+            l.extend([
+                {'params': self.mlp_tint.parameters(), 'lr': training_args.mlp_tint_lr_init, "name": "mlp_tint"},
+                {'params': self.mlp_specular.parameters(), 'lr': training_args.mlp_specular_lr_init, "name": "mlp_specular"}
+            ])
+
+        # if HYBRID_IMP_2 and self.enable_idiv and self.ref:
+        #     l.extend([
+        #         {'params': self.mlp_mid_feature.parameters(), 'lr': training_args.mlp_tint_lr_init, "name": "mlp_idiv"}
+        #     ])
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -361,6 +514,43 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.appearance_lr_delay_mult,
                                                         max_steps=training_args.appearance_lr_max_steps)
 
+        if self.enable_idiv:
+            self.mlp_idiv_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_idiv_lr_init,
+                                                    lr_final=training_args.mlp_idiv_lr_final,
+                                                    lr_delay_mult=training_args.mlp_idiv_lr_delay_mult,
+                                                    max_steps=training_args.mlp_idiv_lr_max_steps)
+
+        if self.ref:
+            self.mlp_tint_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_tint_lr_init,
+                                                    lr_final=training_args.mlp_tint_lr_final,
+                                                    lr_delay_mult=training_args.mlp_tint_lr_delay_mult,
+                                                    max_steps=training_args.mlp_tint_lr_max_steps)
+            self.mlp_roughness_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_roughness_lr_init,
+                                                    lr_final=training_args.mlp_roughness_lr_final,
+                                                    lr_delay_mult=training_args.mlp_roughness_lr_delay_mult,
+                                                    max_steps=training_args.mlp_roughness_lr_max_steps)
+            self.mlp_specular_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_specular_lr_init,
+                                                    lr_final=training_args.mlp_specular_lr_final,
+                                                    lr_delay_mult=training_args.mlp_specular_lr_delay_mult,
+                                                    max_steps=training_args.mlp_specular_lr_max_steps)
+
+        # if HYBRID_IMP_2 and self.enable_idiv and self.ref:
+        #     self.mlp_mid_feature_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_tint_lr_init,
+        #                                             lr_final=training_args.mlp_tint_lr_final,
+        #                                             lr_delay_mult=training_args.mlp_tint_lr_delay_mult,
+        #                                             max_steps=training_args.mlp_tint_lr_max_steps)
+
+    def update_render_status(self, iteration):
+        if iteration < self.enable_ref_iter:
+            self.enable_ref = False
+        else:
+            self.enable_ref = self.ref
+        
+        if iteration < self.enable_idiv_iter:
+            self.enable_idiv = False
+        else:
+            self.enable_idiv = self.idiv
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
@@ -385,6 +575,21 @@ class GaussianModel:
             if self.appearance_dim > 0 and param_group["name"] == "embedding_appearance":
                 lr = self.appearance_scheduler_args(iteration)
                 param_group['lr'] = lr
+            if self.enable_idiv and param_group["name"] == "mlp_idiv":
+                lr = self.mlp_idiv_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.ref and param_group["name"] == "mlp_tint":
+                lr = self.mlp_tint_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.ref and param_group["name"] == "mlp_roughness":
+                lr = self.mlp_roughness_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.ref and param_group["name"] == "mlp_specular":
+                lr = self.mlp_specular_scheduler_args(iteration)
+                param_group['lr'] = lr
+            # if HYBRID_IMP_2 and self.enable_idiv and self.ref and param_group["name"] == "mlp_mid_feature":
+            #     lr = self.mlp_mid_feature_scheduler_args(iteration)
+            #     param_group['lr'] = lr
             
             
     def construct_list_of_attributes(self):
@@ -738,17 +943,17 @@ class GaussianModel:
         mkdir_p(os.path.dirname(path))
         if mode == 'split':
             self.mlp_opacity.eval()
-            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+3+self.opacity_dist_dim).cuda()))
+            opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.opacity_dim).cuda()))
             opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
             self.mlp_opacity.train()
 
             self.mlp_cov.eval()
-            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.feat_dim+3+self.cov_dist_dim).cuda()))
+            cov_mlp = torch.jit.trace(self.mlp_cov, (torch.rand(1, self.cov_dim).cuda()))
             cov_mlp.save(os.path.join(path, 'cov_mlp.pt'))
             self.mlp_cov.train()
 
             self.mlp_color.eval()
-            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
+            color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.color_dim+self.appearance_dim).cuda()))
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
 
@@ -763,6 +968,38 @@ class GaussianModel:
                 emd = torch.jit.trace(self.embedding_appearance, (torch.zeros((1,), dtype=torch.long).cuda()))
                 emd.save(os.path.join(path, 'embedding_appearance.pt'))
                 self.embedding_appearance.train()
+
+            # if HYBRID_IMP_2 and self.enable_idiv and self.ref:
+            #     self.mlp_mid_feature.eval()
+            #     mid_feature_mlp = torch.jit.trace(self.mlp_mid_feature, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
+            #     mid_feature_mlp.save(os.path.join(path, 'mid_feature_mlp.pt'))
+            #     self.mlp_mid_feature.train()
+
+            #     self.mlp_idiv.eval()
+            #     idiv_mlp = torch.jit.trace(self.mlp_idiv, (torch.rand(1, self.feat_dim).cuda()))
+            #     idiv_mlp.save(os.path.join(path, 'idiv_mlp.pt'))
+            #     self.mlp_idiv.train()
+            if self.enable_idiv:
+                self.mlp_idiv.eval()
+                idiv_mlp = torch.jit.trace(self.mlp_idiv, (torch.rand(1, self.idiv_dim+self.appearance_dim).cuda()))
+                idiv_mlp.save(os.path.join(path, 'idiv_mlp.pt'))
+                self.mlp_idiv.train()
+
+            if self.ref:
+                self.mlp_tint.eval()
+                tint_mlp = torch.jit.trace(self.mlp_tint, (torch.rand(1, self.tint_dim+self.appearance_dim).cuda()))
+                tint_mlp.save(os.path.join(path, 'tint_mlp.pt'))
+                self.mlp_tint.train()
+
+                self.mlp_roughness.eval()
+                roughness_mlp = torch.jit.trace(self.mlp_roughness, (torch.rand(1, self.rough_dim+self.appearance_dim).cuda()))
+                roughness_mlp.save(os.path.join(path, 'roughness_mlp.pt'))
+                self.mlp_roughness.train()
+
+                self.mlp_specular.eval()
+                specular_mlp = torch.jit.trace(self.mlp_specular, (torch.rand(1, self.spec_dim+self.appearance_dim).cuda()))
+                specular_mlp.save(os.path.join(path, 'specular_mlp.pt'))
+                self.mlp_specular.train()
 
         elif mode == 'unite':
             if self.use_feat_bank:
@@ -799,6 +1036,14 @@ class GaussianModel:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
                 self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
+            if self.enable_idiv:
+                self.mlp_idiv = torch.jit.load(os.path.join(path, 'idiv_mlp.pt')).cuda()
+            # if HYBRID_IMP_2 and self.enable_idiv and self.ref:
+            #     self.mlp_mid_feature = torch.jit.load(os.path.join(path, 'mid_feature_mlp.pt')).cuda()
+            if self.ref:
+                self.mlp_tint = torch.jit.load(os.path.join(path, 'tint_mlp.pt')).cuda()
+                self.mlp_roughness = torch.jit.load(os.path.join(path, 'roughness_mlp.pt')).cuda()
+                self.mlp_specular = torch.jit.load(os.path.join(path, 'specular_mlp.pt')).cuda()
         elif mode == 'unite':
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])

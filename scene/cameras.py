@@ -12,12 +12,12 @@
 import torch
 from torch import nn
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda", normal=None,
                  ):
         super(Camera, self).__init__()
 
@@ -28,6 +28,7 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.normal = normal
 
         try:
             self.data_device = torch.device(data_device)
@@ -39,6 +40,12 @@ class Camera(nn.Module):
         self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+        self.Fx = fov2focal(FoVx, self.image_width)
+        self.Fy = fov2focal(FoVy, self.image_height)
+        self.Cx = 0.5 * self.image_width
+        self.Cy = 0.5 * self.image_height
+
+        self.mask = gt_alpha_mask
 
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask.to(self.data_device)
@@ -55,6 +62,23 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    # source: Gaussian Shader
+    def get_calib_matrix_nerf(self):
+        focal = fov2focal(self.FoVx, self.image_width)  # original focal length
+        intrinsic_matrix = torch.tensor([[focal, 0, self.image_width / 2], [0, focal, self.image_height / 2], [0, 0, 1]]).float()
+        extrinsic_matrix = self.world_view_transform.transpose(0,1).contiguous() # cam2world
+        return intrinsic_matrix, extrinsic_matrix
+
+    def get_rays(self, scale=1.0):
+        W, H = int(self.image_width/scale), int(self.image_height/scale)
+        ix, iy = torch.meshgrid(
+            torch.arange(W), torch.arange(H), indexing='xy')
+        rays_d = torch.stack(
+                    [(ix-self.Cx/scale) / self.Fx * scale,
+                    (iy-self.Cy/scale) / self.Fy * scale,
+                    torch.ones_like(ix)], -1).float().cuda()
+        return rays_d
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

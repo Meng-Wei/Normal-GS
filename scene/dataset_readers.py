@@ -44,6 +44,8 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
 
+    normal: np.array = None
+
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
     train_cameras: list
@@ -277,6 +279,13 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
                 image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
 
+            normal_image_path = os.path.join(path, "normal", image_name + "_normal.png")
+            normal_image = Image.open(normal_image_path)
+            normal_im_data = np.array(normal_image.convert("RGBA"))
+            bg = np.array([0, 0, 0])
+            norm_normal_data = normal_im_data / 255.0
+            normal_arr = norm_normal_data[:,:,:3] * norm_normal_data[:, :, 3:4] + bg * (1 - norm_normal_data[:, :, 3:4])
+
             if fovx is not None:
                 fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
                 FovY = fovy 
@@ -287,7 +296,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
                 FovX = focal2fov(frame["fl_x"], image.size[0])
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], normal=normal_arr))
             
             if is_debug and idx > 50:
                 break

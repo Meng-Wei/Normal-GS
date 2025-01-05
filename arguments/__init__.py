@@ -75,7 +75,13 @@ class ModelParams(ParamGroup):
         self.add_opacity_dist = False
         self.add_cov_dist = False
         self.add_color_dist = False
-        
+
+        self.idiv = False
+        self.ref = False
+        self.deg_view = 5
+        self.enable_idiv_iter = 5000
+        self.enable_ref_iter = 200
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -118,11 +124,6 @@ class OptimizationParams(ParamGroup):
         self.mlp_cov_lr_final = 0.004
         self.mlp_cov_lr_delay_mult = 0.01
         self.mlp_cov_lr_max_steps = 30_000
-        
-        self.mlp_color_lr_init = 0.008
-        self.mlp_color_lr_final = 0.00005
-        self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
 
         self.mlp_color_lr_init = 0.008
         self.mlp_color_lr_final = 0.00005
@@ -139,6 +140,26 @@ class OptimizationParams(ParamGroup):
         self.appearance_lr_delay_mult = 0.01
         self.appearance_lr_max_steps = 30_000
 
+        self.mlp_idiv_lr_init = 0.008
+        self.mlp_idiv_lr_final = 0.00005
+        self.mlp_idiv_lr_delay_mult = 0.01
+        self.mlp_idiv_lr_max_steps = 30_000
+
+        self.mlp_tint_lr_init = 0.008
+        self.mlp_tint_lr_final = 0.00005
+        self.mlp_tint_lr_delay_mult = 0.01
+        self.mlp_tint_lr_max_steps = 30_000
+
+        self.mlp_roughness_lr_init = 0.002
+        self.mlp_roughness_lr_final = 0.00002
+        self.mlp_roughness_lr_delay_mult = 0.01
+        self.mlp_roughness_lr_max_steps = 30_000
+
+        self.mlp_specular_lr_init = 0.008
+        self.mlp_specular_lr_final = 0.00005
+        self.mlp_specular_lr_delay_mult = 0.01
+        self.mlp_specular_lr_max_steps = 30_000
+
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         
@@ -151,6 +172,33 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+
+        # Depth-Normal Regularizer
+        self.depth_normal_start = 5000
+        self.depth_normal_end = 30_000
+        self.lambda_depth_normal = 0.01
+
+        self.use_normalized_attributes = False
+        self.omit_opacity_threshold = 0.5
+
+        # Regularizer (Experimental)
+        # RefNeRF Normal-View Dot Product (no effects cause our normals are not dependent on opacities)
+        self.back_normal_start = -1
+        self.back_normal_end = 30_000
+        self.lambda_back_normal = 0.01
+
+        # Total Variation
+        self.tv_start = -1
+        self.tv_end = 25_000
+        self.tv_normal = True
+        self.lambda_tv = 0.01
+
+        # Opacity
+        self.reg_opacity_start = -1
+        self.reg_opacity_end = 30_000
+        self.lambda_reg_opacity = 0.01
+
+        self.plate = False
 
         super().__init__(parser, "Optimization Parameters")
 

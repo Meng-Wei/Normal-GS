@@ -13,9 +13,9 @@ import os
 import numpy as np
 
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+# cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+# result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
+# os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
@@ -33,7 +33,7 @@ import torchvision.transforms.functional as tf
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, ssim, predicted_normal_loss, total_variation, cross_entropy_loss
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -43,6 +43,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from utils.graphics_utils import normalize_rendered_by_weights, render_normal_from_depth
+from utils.image_utils import linear_to_srgb
+import torch.nn.functional as F
 
 # torch.set_num_threads(32)
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
@@ -56,7 +59,7 @@ except ImportError:
     print("not found tf board")
 
 def saveRuntimeCode(dst: str) -> None:
-    additionalIgnorePatterns = ['.git', '.gitignore']
+    additionalIgnorePatterns = ['.git', '.gitignore', 'submodules', 'lpipsPyTorch', 'SIBR_viewers', 'assets', 'mipnerf360', '*.tar']
     ignorePatterns = set()
     ROOT = '.'
     with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
@@ -83,7 +86,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.idiv, dataset.ref,
+                              dataset.enable_idiv_iter, dataset.enable_ref_iter, dataset.deg_view)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -97,7 +101,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         if network_gui.conn == None:
             network_gui.try_connect()
@@ -116,12 +120,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         iter_start.record()
 
+        gaussians.update_render_status(iteration)
         gaussians.update_learning_rate(iteration)
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-        
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
@@ -130,19 +134,77 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+
+        # Render Extra
+        reg_back_normal = (opt.back_normal_start != -1) and (iteration > opt.back_normal_start) and (iteration < opt.back_normal_end) and (gaussians.ref)
+        reg_pred_normal = (opt.depth_normal_start != -1) and (iteration > opt.depth_normal_start) and (iteration < opt.depth_normal_end)
+        reg_tv = (opt.tv_start != -1) and (iteration > opt.tv_start) and (iteration < opt.tv_end) and (opt.tv_normal)
+        reg_opacity = (opt.reg_opacity_start != -1) and (iteration > opt.reg_opacity_start) and (iteration < opt.reg_opacity_end)
+        render_full = reg_pred_normal or reg_tv
+        render_n = reg_back_normal or render_full
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
-        
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad,
+                            render_n=render_n, render_dotprod=reg_back_normal, render_full=render_full)
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+
+        # image = linear_to_srgb(image)
+
+        image = torch.clamp(image, 0.0, 1.0)
 
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-
         ssim_loss = (1.0 - ssim(image, gt_image))
+
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+
+        if opt.plate:
+            sorted_scale, _ = torch.sort(scaling, dim=-1)
+            min_scale_loss = sorted_scale[...,0]
+            loss += 100.0*min_scale_loss.mean()
+
+        # Add Extra Loss
+        if reg_pred_normal or reg_tv:
+            alpha = render_pkg["alpha"].detach()[0] # H, W
+            # alpha = render_pkg["alpha"][0] # H, W
+            normal = render_pkg["normal"]
+            depth = render_pkg["depth"][0] # view space
+            surface_mask = alpha > opt.omit_opacity_threshold # H, W
+            # if iteration > 15000 and opt.use_normalized_attributes:
+            if opt.use_normalized_attributes:
+                normal = normalize_rendered_by_weights(normal, alpha, opt.omit_opacity_threshold)
+                # depth = normalize_rendered_by_weights(depth, alpha, opt.omit_opacity_threshold)
+
+        losses_extra = {}
+        if reg_back_normal:
+            dotprod_img = render_pkg["dotprod"]
+            losses_extra["back_normal"] = dotprod_img.mean()
+        if reg_pred_normal:
+            # lambda_decay = pred_normal_smooth(iteration - opt.depth_normal_start)
+            # if (iteration % 1000 == 0):
+            #     print("\n", lambda_decay)
+            if opt.use_normalized_attributes:
+                normal_from_depth = render_normal_from_depth(viewpoint_cam, depth)
+                losses_extra['depth_normal'] = predicted_normal_loss(normal, normal_from_depth, surface_mask, threshold=opt.omit_opacity_threshold)
+            else:
+                normal_from_depth = render_normal_from_depth(viewpoint_cam, depth) * alpha
+                losses_extra['depth_normal'] = predicted_normal_loss(normal, normal_from_depth, surface_mask, threshold=opt.omit_opacity_threshold)
+        if reg_tv:
+            losses_extra["tv"] = 0.0
+            if opt.tv_normal:
+                losses_extra["tv"] += total_variation(normal, surface_mask)
+                # surface_mask_ = surface_mask[None, ...].repeat(3, 1, 1)
+                # curv_n = normal2curv(normal, surface_mask_)
+                # losses_extra["tv"] += l1_loss(curv_n * 1, 0)
+
+        if reg_opacity:
+            opacity_mask = torch.gt(opacity, 0.01) * torch.le(opacity, 0.99)
+            losses_extra['reg_opacity'] = cross_entropy_loss(opacity * opacity_mask)
+
+        for k in losses_extra.keys():
+            loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
 
         loss.backward()
         
@@ -238,6 +300,9 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 for idx, viewpoint in enumerate(config['cameras']):
                     voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
+                    # image = renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"]
+                    # image = linear_to_srgb(image)
+                    # image = torch.clamp(image, 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 30):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -298,6 +363,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         t_list.append(t_end - t_start)
 
         # renders
+        # rendering = torch.clamp(linear_to_srgb(render_pkg["render"]), 0.0, 1.0)
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = (render_pkg["radii"] > 0).sum()
         visible_count_list.append(visible_count)
@@ -324,7 +390,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist, dataset.idiv, dataset.ref,
+                              dataset.enable_idiv_iter, dataset.enable_ref_iter, dataset.deg_view)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 
@@ -520,7 +587,7 @@ if __name__ == "__main__":
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     
     # training
